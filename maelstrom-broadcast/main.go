@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"maps"
+	"slices"
 	"sync"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
@@ -10,19 +12,25 @@ import (
 
 type server struct {
 	node       *maelstrom.Node
-	values     []float64
-	neighbours map[string]interface{}
+	values     map[int]bool
+	neighbours topology
 
 	valuesMu sync.RWMutex
+	topoMu   sync.RWMutex
+}
+
+type topology struct {
+	topo []string
 }
 
 func main() {
 	n := maelstrom.NewNode()
-	s := &server{node: n}
+	s := &server{node: n, values: make(map[int]bool)}
 
 	n.Handle("broadcast", s.broadcast)
 	n.Handle("read", s.read)
 	n.Handle("topology", s.topology)
+	n.Handle("broadcast_ok", s.recvResp)
 
 	if err := n.Run(); err != nil {
 		log.Printf("Error is %s", err)
@@ -40,7 +48,11 @@ func (s *server) broadcast(msg maelstrom.Message) error {
 
 	// Store the value
 	s.valuesMu.Lock()
-	s.values = append(s.values, body["message"].(float64))
+	var val = int(body["message"].(float64))
+	if !s.values[val] {
+		s.sendToNeighbour(val, msg.Src)
+	}
+	s.values[val] = true
 	defer s.valuesMu.Unlock()
 
 	// Update the message type to return back.
@@ -63,7 +75,7 @@ func (s *server) read(msg maelstrom.Message) error {
 	s.valuesMu.RLock()
 	body = map[string]any{
 		"type":     "read_ok",
-		"messages": s.values,
+		"messages": slices.Collect(maps.Keys(s.values)),
 	}
 	defer s.valuesMu.RUnlock()
 
@@ -79,7 +91,12 @@ func (s *server) topology(msg maelstrom.Message) error {
 	}
 
 	// Store the neighbours
-	s.neighbours = body["topology"].(map[string]interface{})
+	s.topoMu.Lock()
+	t := body["topology"].(map[string]interface{})
+	for _, val := range t[msg.Dest].([]interface{}) {
+		s.neighbours.topo = append(s.neighbours.topo, val.(string))
+	}
+	defer s.topoMu.Unlock()
 
 	// Update the message type to return back.
 	body = map[string]any{
@@ -88,4 +105,32 @@ func (s *server) topology(msg maelstrom.Message) error {
 
 	// Echo the original message back with the updated message type.
 	return s.node.Reply(msg, body)
+}
+
+func (s *server) sendToNeighbour(val int, sender string) {
+	s.topoMu.RLock()
+	nbor := s.neighbours.topo
+	log.Printf("Neighbours are %s", nbor)
+	defer s.topoMu.RUnlock()
+
+	for _, n := range nbor {
+		if sender == n {
+			continue
+		}
+		err := s.node.Send(
+			n,
+			map[string]any{
+				"type":    "broadcast",
+				"message": float64(val),
+			},
+		)
+		if err != nil {
+			log.Printf("Error is %s", err)
+			log.Fatal(err)
+		}
+	}
+}
+
+func (s *server) recvResp(msg maelstrom.Message) error {
+	return nil
 }
