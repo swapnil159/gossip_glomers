@@ -1,5 +1,7 @@
 package main
 
+// Note: This solution works for challenge 3e as well.
+
 import (
 	"encoding/json"
 	"log"
