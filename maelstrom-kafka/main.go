@@ -1,18 +1,27 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"math"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/google/uuid"
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
-type server struct {
-	node *maelstrom.Node
+const retries = 100
 
-	logs    map[string][]int
+type ctxKey string
+
+type server struct {
+	node  *maelstrom.Node
+	linKv *maelstrom.KV
+
 	commits map[string]int
 
 	logsMu sync.RWMutex
@@ -21,9 +30,9 @@ type server struct {
 
 func main() {
 	n := maelstrom.NewNode()
-	s := &server{node: n}
+	kv := maelstrom.NewLinKV(n)
+	s := &server{node: n, linKv: kv}
 
-	s.logs = make(map[string][]int)
 	s.commits = make(map[string]int)
 
 	n.Handle("send", s.send)
@@ -46,11 +55,13 @@ func (s *server) send(msg maelstrom.Message) error {
 
 	var key = body["key"].(string)
 	var val = int(body["msg"].(float64))
+	var msgId = int(body["msg_id"].(float64))
 
-	s.logsMu.Lock()
-	defer s.logsMu.Unlock()
-	s.logs[key] = append(s.logs[key], val)
-	var size = len(s.logs[key])
+	size, err := s.updateLogs(key, val, msgId)
+
+	if err != nil {
+		return errors.New("could not update value of key in storage")
+	}
 
 	// Update the message type to return back.
 	body = map[string]any{
@@ -70,20 +81,19 @@ func (s *server) poll(msg maelstrom.Message) error {
 	}
 
 	var offsets = body["offsets"].(map[string]interface{})
+	var msgId = int(body["msg_id"].(float64))
 	var msgResp = make(map[string][][]int)
 
-	s.logsMu.RLock()
-	defer s.logsMu.RUnlock()
 	for key, offset := range offsets {
-		var curr []int = s.logs[key]
-		if len(curr) == 0 || len(curr) <= int(offset.(float64)) {
+		curr, err := s.getCurrLogs(key, msgId)
+		if err != nil || len(curr) == 0 || len(curr) <= int(offset.(float64)) {
 			continue
 		}
 		var resp [][]int
 		for i := int(offset.(float64)); i < len(curr); i++ {
 			var slc []int = make([]int, 0)
 			slc = append(slc, i)
-			slc = append(slc, s.logs[key][i])
+			slc = append(slc, curr[i])
 			resp = append(resp, slc)
 		}
 		msgResp[key] = resp
@@ -148,4 +158,60 @@ func (s *server) listCommits(msg maelstrom.Message) error {
 
 	// Echo the original message back with the updated message type.
 	return s.node.Reply(msg, body)
+}
+
+func (s *server) getCurrLogs(key string, msgId int) ([]int, error) {
+	s.logsMu.RLock()
+	defer s.logsMu.RUnlock()
+	return s.readLogsFromKv(key, msgId)
+}
+
+func (s *server) readLogsFromKv(key string, msgId int) ([]int, error) {
+	var uuid = uuid.New().String()
+	var ctx = context.WithValue(context.Background(), ctxKey(uuid), msgId)
+	var currVal, err = s.linKv.Read(ctx, key)
+
+	if err != nil && strings.Contains(err.Error(), "key does not exist") {
+		return make([]int, 0), nil
+	}
+
+	if err != nil {
+		return make([]int, 0), err
+	}
+
+	var data []int
+
+	// Iterate through the []interface{}
+	for _, item := range currVal.([]interface{}) {
+		if val, ok := item.(float64); ok {
+			data = append(data, int(val))
+		} else {
+			// Handle cases where the item is not an int
+			log.Printf("Warning: Skipping non-integer value: %v (type %T)\n", item, item)
+		}
+	}
+
+	return data, nil
+}
+
+func (s *server) updateLogs(key string, val int, msgId int) (int, error) {
+	s.logsMu.Lock()
+	defer s.logsMu.Unlock()
+	for i := 0; i < retries; i++ {
+		currVal, err := s.readLogsFromKv(key, msgId)
+		if err != nil {
+			log.Printf("Error is %s", err)
+			continue
+		}
+		updVal := append(currVal, val)
+		var uuid = uuid.New().String()
+		var ctx = context.WithValue(context.Background(), ctxKey(uuid), msgId)
+		err = s.linKv.CompareAndSwap(ctx, key, currVal, updVal, true /* createIfNotExists */)
+		if err == nil {
+			return len(updVal), nil
+		}
+		log.Printf("Error is %s", err)
+		time.Sleep(time.Duration(i) * 10 * time.Millisecond)
+	}
+	return -1, errors.New("could not write to key value store")
 }
