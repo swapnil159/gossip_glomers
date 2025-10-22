@@ -4,24 +4,40 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"os"
 	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 type server struct {
-	node *maelstrom.Node
+	node       *maelstrom.Node
+	neighbours topology
 
 	kv map[int]int
 
-	kvMu sync.RWMutex
+	kvMu   sync.RWMutex
+	topoMu sync.RWMutex
 }
+
+type topology struct {
+	topo []string
+}
+
+const retries = 100
 
 func main() {
 	n := maelstrom.NewNode()
 	s := &server{node: n}
 
 	s.kv = make(map[int]int)
+	err := s.initTopology()
+	if err != nil {
+		log.Fatal(err)
+		os.Exit(0)
+	}
+
 	n.Handle("txn", s.txn)
 
 	if err := n.Run(); err != nil {
@@ -62,7 +78,12 @@ func (s *server) txn(msg maelstrom.Message) error {
 		"type": "txn_ok",
 		"txn":  data,
 	}
-	return s.node.Reply(msg, body)
+	err := s.node.Reply(msg, body)
+	if err != nil {
+		return err
+	}
+
+	return s.sendToNeighbours(msg)
 }
 
 func (s *server) read(key int) *int {
@@ -83,5 +104,52 @@ func (s *server) write(key int, val int) error {
 
 	s.kv[key] = val
 
+	return nil
+}
+
+func (s *server) initTopology() error {
+	// Store the neighbours
+	s.topoMu.Lock()
+	defer s.topoMu.Unlock()
+	for _, val := range s.node.NodeIDs() {
+		if val == s.node.ID() {
+			continue
+		}
+		s.neighbours.topo = append(s.neighbours.topo, val)
+	}
+
+	return nil
+}
+
+func (s *server) sendToNeighbours(msg maelstrom.Message) error {
+	s.topoMu.RLock()
+	nbor := s.neighbours.topo
+	s.topoMu.RUnlock()
+
+	if msg.Src[0] == 'n' {
+		return nil
+	}
+
+	for _, n := range nbor {
+		node := n
+		go func() {
+			for i := 0; i < retries; i++ {
+				err := s.node.RPC(
+					node,
+					msg.Body,
+					s.recvResp)
+				if err == nil {
+					return
+				}
+				log.Printf("Error is %s", err)
+				time.Sleep(time.Duration(i) * 100 * time.Millisecond)
+			}
+		}()
+	}
+
+	return nil
+}
+
+func (s *server) recvResp(msg maelstrom.Message) error {
 	return nil
 }
